@@ -6503,6 +6503,14 @@ class NifFormat(FileFormat):
                             for x in weight:
                                 x[1] /= totalweight
 
+            # find the bones influencing each triangle
+            # weights is not modified after this point, so these sets are
+            # computed once here, and filtered along with triangles below
+            tribonesets = [
+                frozenset(bonenum
+                          for t in tri for bonenum, boneweight in weights[t])
+                for tri in triangles]
+
             # split triangles into partitions
             logger.info("Creating partitions")
             parts = []
@@ -6518,13 +6526,9 @@ class NifFormat(FileFormat):
                     # the partition, similar for newtrianglepartmap
                     newtriangles = []
                     newtrianglepartmap = []
-                    for tri, partindex in zip(triangles, trianglepartmap):
-                        # find the bones influencing this triangle
-                        tribones = []
-                        for t in tri:
-                            tribones.extend([
-                                bonenum for bonenum, boneweight in weights[t]])
-                        tribones = set(tribones)
+                    newtribonesets = []
+                    for tri, partindex, tribones in zip(
+                            triangles, trianglepartmap, tribonesets):
                         # if part has no bones,
                         # or if part has all bones of tribones and index coincides
                         # then add this triangle to this part
@@ -6539,25 +6543,23 @@ class NifFormat(FileFormat):
                         else:
                             newtriangles.append(tri)
                             newtrianglepartmap.append(partindex)
+                            newtribonesets.append(tribones)
                     triangles = newtriangles
                     trianglepartmap = newtrianglepartmap
+                    tribonesets = newtribonesets
 
                     # if we have room left in the partition
                     # then add adjacent triangles
                     addtriangles = False
                     newtriangles = []
                     newtrianglepartmap = []
+                    newtribonesets = []
                     if len(part[0]) < maxbonesperpartition:
-                        for tri, partindex in zip(triangles, trianglepartmap):
+                        for tri, partindex, tribones in zip(
+                                triangles, trianglepartmap, tribonesets):
                             # if triangle is adjacent, and has same index
                             # then check if it can be added to the partition
                             if (usedverts & set(tri)) and (part[2] == partindex):
-                                # find the bones influencing this triangle
-                                tribones = []
-                                for t in tri:
-                                    tribones.extend([
-                                        bonenum for bonenum, boneweight in weights[t]])
-                                tribones = set(tribones)
                                 # and check if we exceed the maximum number of allowed
                                 # bones
                                 if len(part[0] | tribones) <= maxbonesperpartition:
@@ -6570,11 +6572,14 @@ class NifFormat(FileFormat):
                                 else:
                                     newtriangles.append(tri)
                                     newtrianglepartmap.append(partindex)
+                                    newtribonesets.append(tribones)
                             else:
                                 newtriangles.append(tri)
                                 newtrianglepartmap.append(partindex)
+                                newtribonesets.append(tribones)
                         triangles = newtriangles
                         trianglepartmap = newtrianglepartmap
+                        tribonesets = newtribonesets
 
                 parts.append(part)
 
@@ -6687,22 +6692,30 @@ class NifFormat(FileFormat):
                     # store part for next iteration
                     lastpart = part
 
-            for skinpartblock, part in zip(skinpart.skin_partition_blocks, parts):
-                # get sorted list of bones
+            for partnum, (skinpartblock, part) in enumerate(
+                    zip(skinpart.skin_partition_blocks, parts)):
+                # get sorted list of bones, and a map from each bone to its
+                # index in that list
                 bones = sorted(list(part[0]))
+                bone_local = dict((bonenum, i) for i, bonenum in enumerate(bones))
                 triangles = part[1]
                 logger.info("Optimizing triangle ordering in partition %i"
-                            % parts.index(part))
+                            % partnum)
                 # optimize triangles for vertex cache and calculate strips
                 triangles = pyffi.utils.vertex_cache.get_cache_optimized_triangles(
                     triangles)
-                strips = pyffi.utils.vertex_cache.stable_stripify(
-                    triangles, stitchstrips=stitchstrips)
-                triangles_size = 3 * len(triangles)
-                strips_size = len(strips) + sum(len(strip) for strip in strips)
+                # the strips are only needed if they may be used
+                if stripify is not False:
+                    strips = pyffi.utils.vertex_cache.stable_stripify(
+                        triangles, stitchstrips=stitchstrips)
+                # vertices in first-seen order, and a map from each
+                # vertex to its index in that list
                 vertices = []
+                vertex_local = {}
                 # decide whether to use strip or triangles as primitive
                 if stripify is None:
+                    triangles_size = 3 * len(triangles)
+                    strips_size = len(strips) + sum(len(strip) for strip in strips)
                     stripifyblock = (
                         strips_size < triangles_size
                         and all(len(strip) < 65536 for strip in strips))
@@ -6719,7 +6732,8 @@ class NifFormat(FileFormat):
                     for strip in strips:
                         numtriangles += len(strip) - 2
                         for t in strip:
-                            if t not in vertices:
+                            if t not in vertex_local:
+                                vertex_local[t] = len(vertices)
                                 vertices.append(t)
                 else:
                     numtriangles = len(triangles)
@@ -6728,7 +6742,8 @@ class NifFormat(FileFormat):
                     # by triangle
                     for tri in triangles:
                         for t in tri:
-                            if t not in vertices:
+                            if t not in vertex_local:
+                                vertex_local[t] = len(vertices)
                                 vertices.append(t)
                 # set all the data
                 skinpartblock.num_vertices = len(vertices)
@@ -6762,12 +6777,6 @@ class NifFormat(FileFormat):
                     skinpartblock.vertex_map[i] = v
                 skinpartblock.has_vertex_weights = True
                 skinpartblock.vertex_weights.update_size()
-                for i, v in enumerate(vertices):
-                    for j in range(skinpartblock.num_weights_per_vertex):
-                        if j < len(weights[v]):
-                            skinpartblock.vertex_weights[i][j] = weights[v][j][1]
-                        else:
-                            skinpartblock.vertex_weights[i][j] = 0.0
                 if stripifyblock:
                     skinpartblock.has_faces = True
                     skinpartblock.strip_lengths.update_size()
@@ -6776,7 +6785,7 @@ class NifFormat(FileFormat):
                     skinpartblock.strips.update_size()
                     for i, strip in enumerate(strips):
                         for j, v in enumerate(strip):
-                            skinpartblock.strips[i][j] = vertices.index(v)
+                            skinpartblock.strips[i][j] = vertex_local[v]
                 else:
                     skinpartblock.has_faces = True
                     # clear strip lengths array
@@ -6785,43 +6794,42 @@ class NifFormat(FileFormat):
                     skinpartblock.strips.update_size()
                     skinpartblock.triangles.update_size()
                     for i, (v_1,v_2,v_3) in enumerate(triangles):
-                        skinpartblock.triangles[i].v_1 = vertices.index(v_1)
-                        skinpartblock.triangles[i].v_2 = vertices.index(v_2)
-                        skinpartblock.triangles[i].v_3 = vertices.index(v_3)
+                        skinpartblock.triangles[i].v_1 = vertex_local[v_1]
+                        skinpartblock.triangles[i].v_2 = vertex_local[v_2]
+                        skinpartblock.triangles[i].v_3 = vertex_local[v_3]
                 skinpartblock.has_bone_indices = True
                 skinpartblock.bone_indices.update_size()
+                num_weights_per_vertex = skinpartblock.num_weights_per_vertex
                 for i, v in enumerate(vertices):
+                    # (bone index, weight) rows for this vertex
+                    vweights = []
                     # the boneindices set keeps track of indices that have not been
                     # used yet
                     boneindices = set(range(skinpartblock.num_bones))
-                    for j in range(len(weights[v])):
-                        skinpartblock.bone_indices[i][j] = bones.index(weights[v][j][0])
-                        boneindices.remove(skinpartblock.bone_indices[i][j])
-                    for j in range(len(weights[v]),skinpartblock.num_weights_per_vertex):
+                    for bonenum, boneweight in weights[v]:
+                        boneindex = bone_local[bonenum]
+                        vweights.append([boneindex, boneweight])
+                        boneindices.remove(boneindex)
+                    for j in range(len(weights[v]), num_weights_per_vertex):
                         if padbones:
                             # if padbones is True then we have enforced
                             # num_bones == num_weights_per_vertex so this will not trigger
                             # a KeyError
-                            skinpartblock.bone_indices[i][j] = boneindices.pop()
+                            vweights.append([boneindices.pop(), 0.0])
                         else:
-                            skinpartblock.bone_indices[i][j] = 0
-
-                # sort weights
-                for i, v in enumerate(vertices):
-                    vweights = []
-                    for j in range(skinpartblock.num_weights_per_vertex):
-                        vweights.append([
-                            skinpartblock.bone_indices[i][j],
-                            skinpartblock.vertex_weights[i][j]])
+                            vweights.append([0, 0.0])
+                    # sort weights
                     if padbones:
                         # by bone index (for ffvt3r)
                         vweights.sort(key=lambda w: w[0])
                     else:
                         # by weight (for fallout 3, largest weight first)
                         vweights.sort(key=lambda w: -w[1])
-                    for j in range(skinpartblock.num_weights_per_vertex):
-                        skinpartblock.bone_indices[i][j] = vweights[j][0]
-                        skinpartblock.vertex_weights[i][j] = vweights[j][1]
+                    vertex_bone_indices = skinpartblock.bone_indices[i]
+                    vertex_weights = skinpartblock.vertex_weights[i]
+                    for j, (boneindex, boneweight) in enumerate(vweights):
+                        vertex_bone_indices[j] = boneindex
+                        vertex_weights[j] = boneweight
 
             return lostweight
 
