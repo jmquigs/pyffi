@@ -6846,7 +6846,7 @@ class NifFormat(FileFormat):
 
             verts = geomdata.vertices
 
-            for skindatablock in skindata.bone_list:
+            def update_bone(skindatablock):
                 # find all vertices influenced by this bone
                 boneverts = [verts[skinweight.index]
                              for skinweight in skindatablock.vertex_weights]
@@ -6871,6 +6871,60 @@ class NifFormat(FileFormat):
                     d = center - v
                     r2 = max(r2, d.x*d.x+d.y*d.y+d.z*d.z)
                 radius = r2 ** 0.5
+
+                # transform center in proper coordinates (radius remains unaffected)
+                center *= skindatablock.get_transform()
+
+                # save data
+                skindatablock.bounding_sphere_offset.x = center.x
+                skindatablock.bounding_sphere_offset.y = center.y
+                skindatablock.bounding_sphere_offset.z = center.z
+                skindatablock.bounding_sphere_radius = radius
+
+            try:
+                import numpy as np
+            except ImportError:
+                # no numpy: update every bone with the code above
+                for skindatablock in skindata.bone_list:
+                    update_bone(skindatablock)
+                return
+
+            # the same computation, vectorized over the vertices of each bone
+            # the arithmetic is done in the same order as above, so the
+            # results are identical
+            vertarray = np.array([(v.x, v.y, v.z) for v in verts],
+                                 dtype=np.float64).reshape(-1, 3)
+            for skindatablock in skindata.bone_list:
+                idx = np.array([skinweight.index
+                                for skinweight in skindatablock.vertex_weights],
+                               dtype=np.intp)
+                if len(idx) == 0:
+                    # keep the behavior of the code above (ValueError)
+                    update_bone(skindatablock)
+                    continue
+                points = vertarray[idx]
+                low = points.min(axis=0)
+                high = points.max(axis=0)
+                # min and max may pick a different zero (0.0 or -0.0) than
+                # the code above, which matters only if both are zero, and
+                # they treat nan differently: use the code above in those
+                # cases
+                if (not (np.isfinite(low).all() and np.isfinite(high).all())
+                    or ((low == 0) & (high == 0)).any()):
+                    update_bone(skindatablock)
+                    continue
+                # center is in the center of the bounding box
+                c = (low + high) * 0.5
+                # radius is the largest distance from the center
+                d = c - points
+                r2s = d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1] + d[:, 2] * d[:, 2]
+                r2 = max(0.0, float(r2s.max()))
+                radius = r2 ** 0.5
+
+                center = NifFormat.Vector3()
+                center.x = float(c[0])
+                center.y = float(c[1])
+                center.z = float(c[2])
 
                 # transform center in proper coordinates (radius remains unaffected)
                 center *= skindatablock.get_transform()
